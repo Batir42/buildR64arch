@@ -166,16 +166,43 @@ function set_emmcbootpart {
   mmc bootpart enable ${2} 1 ${1}
 }
 
+# The bpir3 emmc atf can carry the SD/MMC boot device header (SDMMC_BOOT,
+# BRLYT type 0x10008). Booted from the user area (bootpart 7) the BootROM
+# halts. Make a copy with the eMMC header (EMMC_BOOT, type 0x10005) to boot
+# it from boot0. The header is outside the signed area, which starts at 0x600.
+function emmc_header_atf {
+  [[ "${target}" == "bpir3" ]] || return 1
+  [ -f "${atffile}" ] || return 1
+  head -c 10 "${atffile}" | cmp -s - <(printf 'SDMMC_BOOT') || return 1
+  [[ "$(od -An -tx1 -j $((0x218)) -N 4 "${atffile}" | xargs)" == "08 00 01 00" ]] || return 1
+  cp -f "${atffile}" "${1}"
+  printf 'EMMC_BOOT\0\xff\xff' | dd of="${1}" bs=1 seek=0 conv=notrunc status=none
+  printf '\x05\x00\x01\x00' | dd of="${1}" bs=1 seek=$((0x218)) conv=notrunc status=none
+  # Only bytes [0,12) and [0x218,0x21c) may differ (cmp -l offsets are 1-based)
+  if [ "$(stat -c %s "${atffile}")" != "$(stat -c %s "${1}")" ] || \
+     cmp -l "${atffile}" "${1}" | awk '$1 > 12 && ($1 < 537 || $1 > 540) {bad=1} END {exit !bad}'; then
+    echo "Unexpected difference in ${1}, not using it"
+    rm -f "${1}"
+    return 1
+  fi
+}
+
 function fix_emmcbootpart {
   if [ -b "${1}boot0" ]; then # Writing to EMMC boot device
     local hdr=$(head -c 4 "${atfdevice}")
+    local atfboot0="${atfdevice}"
+    if [[ "${hdr}" == "SDMM" ]] && emmc_header_atf "${tmp}/emmc-atf.bin"; then
+      echo "ATF has SD/MMC header, using copy with EMMC header"
+      atfboot0="${tmp}/emmc-atf.bin"
+      hdr="EMMC"
+    fi
     if [[ "${hdr}" == "SDMM" ]] || [[ "${hdr}" == "BRLY" ]]; then
       echo "Customised ATF able to boot from ${1}"
       set_emmcbootpart ${1} 7
     else
       echo -e "ATF needs boot from ${1}boot0, copying..."
       echo 0 > /sys/block/${1/\/dev/\/}boot0/force_ro
-      dd bs=4M if="${atfdevice}" of="${1}boot0" conv=fsync
+      dd bs=4M if="${atfboot0}" of="${1}boot0" conv=fsync
       echo 1 > /sys/block/${1/\/dev/\/}boot0/force_ro
       set_emmcbootpart ${1} 1
     fi
